@@ -16,7 +16,7 @@ import { URI, UriComponents, UriDto, isUriComponents } from '../../../../base/co
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { IOffsetRange, OffsetRange } from '../../../../editor/common/core/offsetRange.js';
 import { IRange } from '../../../../editor/common/core/range.js';
-import { Location, TextEdit } from '../../../../editor/common/languages.js';
+import { Location, SymbolKind, TextEdit } from '../../../../editor/common/languages.js';
 import { localize } from '../../../../nls.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
 import { ChatAgentLocation, IChatAgentCommand, IChatAgentData, IChatAgentResult, IChatAgentService, IChatWelcomeMessageContent, reviveSerializedAgent } from './chatAgents.js';
@@ -60,14 +60,23 @@ export interface IChatRequestPasteVariableEntry extends Omit<IBaseChatRequestVar
 	readonly kind: 'paste';
 	code: string;
 	language: string;
-	fileName: string;
 	pastedLines: string;
+
+	// This is only used for old serialized data and should be removed once we no longer support it
+	fileName: string;
+
+	// This is only undefined on old serialized data
+	copiedFrom: {
+		readonly uri: URI;
+		readonly range: IRange;
+	} | undefined;
 }
 
 export interface ISymbolVariableEntry extends Omit<IBaseChatRequestVariableEntry, 'kind'> {
 	readonly kind: 'symbol';
 	readonly isDynamic: true;
 	readonly value: Location;
+	readonly symbolKind: SymbolKind;
 }
 
 export interface ICommandResultVariableEntry extends Omit<IBaseChatRequestVariableEntry, 'kind'> {
@@ -201,7 +210,6 @@ export interface IChatResponseModel {
 }
 
 export class ChatRequestModel implements IChatRequestModel {
-	private static nextId = 0;
 
 	public response: ChatResponseModel | undefined;
 
@@ -260,8 +268,9 @@ export class ChatRequestModel implements IChatRequestModel {
 		private _attachedContext?: IChatRequestVariableEntry[],
 		private _workingSet?: URI[],
 		public readonly isCompleteAddedRequest = false,
+		restoredId?: string,
 	) {
-		this.id = 'request_' + ChatRequestModel.nextId++;
+		this.id = restoredId ?? 'request_' + generateUuid();
 		// this.timestamp = Date.now();
 	}
 
@@ -439,8 +448,6 @@ export class ChatResponseModel extends Disposable implements IChatResponseModel 
 	private readonly _onDidChange = this._register(new Emitter<void>());
 	readonly onDidChange = this._onDidChange.event;
 
-	private static nextId = 0;
-
 	public readonly id: string;
 
 	public get session() {
@@ -546,7 +553,8 @@ export class ChatResponseModel extends Disposable implements IChatResponseModel 
 		private _result?: IChatAgentResult,
 		followups?: ReadonlyArray<IChatFollowup>,
 		public readonly isCompleteAddedRequest = false,
-		private _isHidden: boolean = false
+		private _isHidden: boolean = false,
+		restoredId?: string
 	) {
 		super();
 
@@ -556,7 +564,7 @@ export class ChatResponseModel extends Disposable implements IChatResponseModel 
 		this._followups = followups ? [...followups] : undefined;
 		this._response = this._register(new Response(_response));
 		this._register(this._response.onDidChangeValue(() => this._onDidChange.fire()));
-		this.id = 'response_' + ChatResponseModel.nextId++;
+		this.id = restoredId ?? 'response_' + generateUuid();
 	}
 
 	/**
@@ -587,7 +595,7 @@ export class ChatResponseModel extends Disposable implements IChatResponseModel 
 	setAgent(agent: IChatAgentData, slashCommand?: IChatAgentCommand) {
 		this._agent = agent;
 		this._slashCommand = slashCommand;
-		this._agentOrSlashCommandDetected = !agent.isDefault;
+		this._agentOrSlashCommandDetected = !agent.isDefault || !!slashCommand;
 		this._onDidChange.fire();
 	}
 
@@ -668,11 +676,15 @@ export interface ISerializableChatsData {
 export type ISerializableChatAgentData = UriDto<IChatAgentData>;
 
 export interface ISerializableChatRequestData {
+	requestId: string;
 	message: string | IParsedChatRequest; // string => old format
 	/** Is really like "prompt data". This is the message in the format in which the agent gets it + variable values. */
 	variableData: IChatRequestVariableData;
 	response: ReadonlyArray<IMarkdownString | IChatResponseProgressFileTreeData | IChatContentInlineReference | IChatAgentMarkdownContentWithVulnerability> | undefined;
+	isHidden: boolean;
+	responseId?: string;
 	agent?: ISerializableChatAgentData;
+	workingSet?: UriComponents[];
 	slashCommand?: IChatAgentCommand;
 	// responseErrorDetails: IChatResponseErrorDetails | undefined;
 	result?: IChatAgentResult; // Optional for backcompat
@@ -1014,7 +1026,8 @@ export class ChatModel extends Disposable implements IChatModel {
 
 				// Old messages don't have variableData, or have it in the wrong (non-array) shape
 				const variableData: IChatRequestVariableData = this.reviveVariableData(raw.variableData);
-				const request = new ChatRequestModel(this, parsedRequest, variableData, raw.timestamp ?? -1);
+				const request = new ChatRequestModel(this, parsedRequest, variableData, raw.timestamp ?? -1, undefined, undefined, undefined, undefined, raw.workingSet?.map((uri) => URI.revive(uri)), undefined, raw.requestId);
+				request.isHidden = !!raw.isHidden;
 				if (raw.response || raw.result || (raw as any).responseErrorDetails) {
 					const agent = (raw.agent && 'metadata' in raw.agent) ? // Check for the new format, ignore entries in the old format
 						reviveSerializedAgent(raw.agent) : undefined;
@@ -1023,7 +1036,8 @@ export class ChatModel extends Disposable implements IChatModel {
 					const result = 'responseErrorDetails' in raw ?
 						// eslint-disable-next-line local/code-no-dangerous-type-assertions
 						{ errorDetails: raw.responseErrorDetails } as IChatAgentResult : raw.result;
-					request.response = new ChatResponseModel(raw.response ?? [new MarkdownString(raw.response)], this, agent, raw.slashCommand, request.id, true, raw.isCanceled, raw.vote, raw.voteDownReason, result, raw.followups);
+					request.response = new ChatResponseModel(raw.response ?? [new MarkdownString(raw.response)], this, agent, raw.slashCommand, request.id, true, raw.isCanceled, raw.vote, raw.voteDownReason, result, raw.followups, undefined, undefined, raw.responseId);
+					request.response.isHidden = !!raw.isHidden;
 					if (raw.usedContext) { // @ulugbekna: if this's a new vscode sessions, doc versions are incorrect anyway?
 						request.response.applyReference(revive(raw.usedContext));
 					}
@@ -1138,7 +1152,7 @@ export class ChatModel extends Disposable implements IChatModel {
 
 	addRequest(message: IParsedChatRequest, variableData: IChatRequestVariableData, attempt: number, chatAgent?: IChatAgentData, slashCommand?: IChatAgentCommand, confirmation?: string, locationData?: IChatLocationData, attachments?: IChatRequestVariableEntry[], workingSet?: URI[], isCompleteAddedRequest?: boolean): ChatRequestModel {
 		const request = new ChatRequestModel(this, message, variableData, Date.now(), attempt, confirmation, locationData, attachments, workingSet, isCompleteAddedRequest);
-		request.response = new ChatResponseModel([], this, chatAgent, slashCommand, request.id, undefined, undefined, undefined, undefined, undefined, undefined, undefined, isCompleteAddedRequest);
+		request.response = new ChatResponseModel([], this, chatAgent, slashCommand, request.id, undefined, undefined, undefined, undefined, undefined, undefined, isCompleteAddedRequest);
 
 		this._requests.push(request);
 		this._lastMessageDate = Date.now();
@@ -1277,6 +1291,7 @@ export class ChatModel extends Disposable implements IChatModel {
 				const agentJson = agent && 'toJSON' in agent ? (agent.toJSON as Function)() :
 					agent ? { ...agent } : undefined;
 				return {
+					requestId: r.id,
 					message,
 					variableData: r.variableData,
 					response: r.response ?
@@ -1291,12 +1306,15 @@ export class ChatModel extends Disposable implements IChatModel {
 							}
 						})
 						: undefined,
+					responseId: r.response?.id,
+					isHidden: r.isHidden,
 					result: r.response?.result,
 					followups: r.response?.followups,
 					isCanceled: r.response?.isCanceled,
 					vote: r.response?.vote,
 					voteDownReason: r.response?.voteDownReason,
 					agent: agentJson,
+					workingSet: r.workingSet,
 					slashCommand: r.response?.slashCommand,
 					usedContext: r.response?.usedContext,
 					contentReferences: r.response?.contentReferences,
